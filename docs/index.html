@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RSS 中文镜像</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--bd:#e5e7eb;--tx:#1f2328;--sub:#6b7280;--ac:#2563eb}
+*{box-sizing:border-box}
+body{margin:0;padding:32px 16px 64px;background:var(--bg);color:var(--tx);
+font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:760px;margin:0 auto}
+h1{font-size:22px;margin:0 0 6px}
+.sub{color:var(--sub);font-size:13px;margin-bottom:24px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px 18px;margin-bottom:14px}
+.card.bad{border-color:#f3c2c2}
+.row{display:flex;align-items:center;gap:10px;justify-content:space-between}
+.title{font-weight:600;font-size:16px}
+.tag{font-size:12px;color:var(--sub);background:#f3f4f6;border-radius:20px;padding:2px 10px;white-space:nowrap}
+.src{color:var(--sub);font-size:12px;word-break:break-all;margin:4px 0 12px}
+.linkbox{margin-top:10px}
+.lab{font-size:12px;color:var(--sub)}
+.line{display:flex;gap:8px;align-items:center;margin-top:4px}
+code{flex:1;background:#f3f4f6;border-radius:6px;padding:7px 10px;font-size:12.5px;
+word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace}
+button{border:1px solid var(--bd);background:#fff;border-radius:6px;padding:6px 12px;
+font-size:12.5px;cursor:pointer;color:var(--tx);white-space:nowrap}
+button:hover{border-color:var(--ac);color:var(--ac)}
+.meta{margin-top:12px;font-size:12px;color:var(--sub)}
+.meta.err{color:#b91c1c}
+.warn{margin-top:10px;padding:10px 12px;border-radius:8px;font-size:12.5px;line-height:1.7;
+background:#fffbeb;border:1px solid #fde68a;color:#92400e}
+.warn.bad2{background:#fef2f2;border-color:#fecaca;color:#991b1b}
+.tip{background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:12px 14px;
+font-size:13px;color:#1e40af;margin-bottom:20px}
+h2{font-size:15px;margin:28px 0 10px}
+ol{margin:0;padding-left:20px;font-size:13.5px;color:#374151}
+ol li{margin-bottom:6px}
+code.inl{background:#f3f4f6;border-radius:4px;padding:1px 5px;font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>RSS 中文镜像</h1>
+  <div class="sub">共 1 个源，成功 1 个 · 最近更新 2026-09-03 15:27:08 UTC</div>
+
+  <div class="tip">
+    把下面的地址填进 Read You（订阅 → 添加 → 输入链接）即可。<br>
+    <strong>Pages 地址</strong>需要你在仓库 Settings → Pages 里把来源设为 <code class="inl">main / docs</code>；
+    <strong>Raw 地址</strong>开箱即用、不用任何设置，但如果 Read You 提示解析失败，请改用 Pages 地址。
+  </div>
+
+  
+    <div class="card">
+      <div class="row">
+        <div class="title">(无标题)</div>
+        <div class="tag">10 条</div>
+      </div>
+      <div class="src">https://2chav.com/feed</div>
+      
+      <div class="linkbox">
+        <span class="lab">Pages 地址（推荐）</span>
+        <div class="line"><code id="p-2chav">https://jasprylucas-art.github.io/-rss-zh-mirror-/2chav.xml</code><button onclick="cp('p-2chav',this)">复制</button></div>
+      </div>
+      <div class="linkbox">
+        <span class="lab">Raw 地址（免设置，立即可用）</span>
+        <div class="line"><code id="r-2chav">https://raw.githubusercontent.com/jasprylucas-art/-rss-zh-mirror-/main/docs/2chav.xml</code><button onclick="cp('r-2chav',this)">复制</button></div>
+      </div>
+      <div class="meta">译文 24 条 · 命中缓存 0 条</div>
+    </div>
+
+  <h2>怎么加更多源？</h2>
+  <ol>
+    <li>打开仓库里的 <code class="inl">feeds.txt</code>，点右上角铅笔图标编辑</li>
+    <li>每行粘贴一个 RSS 地址（<code class="inl">#</code> 开头的行为注释）</li>
+    <li>提交后到 Actions → 翻译 RSS → Run workflow，约 1 分钟生效</li>
+  </ol>
+
+  <h2>自动更新</h2>
+  <ol>
+    <li>默认每小时第 17 分钟自动跑一次（GitHub 可能延迟几分钟）</li>
+    <li>公开仓库完全免费；私有仓库的定时会被 GitHub 在闲置 60 天后停用</li>
+  </ol>
+</div>
+<script>
+function cp(id, btn){
+  var t=document.getElementById(id).textContent;
+  navigator.clipboard.writeText(t).then(function(){
+    var o=btn.textContent; btn.textContent='已复制'; btn.style.color='#16a34a';
+    setTimeout(function(){btn.textContent=o; btn.style.color='';},1500);
+  });
+}
+</script>
+</body>
+</html>
