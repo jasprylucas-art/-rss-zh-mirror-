@@ -1,0 +1,65 @@
+name: 翻译 RSS
+
+on:
+  # 每小时第 17 分钟自动跑一次（GitHub 可能延迟几分钟，属正常）
+  schedule:
+    - cron: '17 * * * *'
+  # 允许在网页上手动点一次
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 忽略译文缓存，全部重新翻译
+        type: boolean
+        default: false
+  # 改了 feeds.txt 就自动跑
+  push:
+    paths:
+      - 'feeds.txt'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rss-zh-mirror
+  cancel-in-progress: false
+
+jobs:
+  translate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 抓取并翻译
+        run: node scripts/translate.mjs
+        env:
+          FORCE: ${{ inputs.force && '1' || '' }}
+          # —— 可选：填了能提升免费额度 / 改善译文质量 ——
+          # 在仓库 Settings → Secrets and variables → Actions 里配置
+          MYMEMORY_EMAIL: ${{ vars.MYMEMORY_EMAIL }}
+          TRANSLATE_DESCRIPTION: ${{ vars.TRANSLATE_DESCRIPTION }}
+          TRANSLATE_CONTENT: ${{ vars.TRANSLATE_CONTENT }}
+          MAX_ITEMS: ${{ vars.MAX_ITEMS }}
+          CONCURRENCY: ${{ vars.CONCURRENCY }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
+
+      - name: 提交生成结果
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "内容无变化，跳过提交"
+          else
+            git commit -m "chore: 更新中文订阅源 $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
