@@ -61,6 +61,8 @@ jobs:
             echo "内容无变化，跳过提交"
           else
             git commit -m "chore: 更新中文订阅源 $(date -u +'%Y-%m-%d %H:%M UTC')"
-            git pull --rebase origin main || true
+            git fetch origin main
+            git merge -X ours origin/main
             git push
           fi
+
