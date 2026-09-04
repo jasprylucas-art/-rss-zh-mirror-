@@ -28,7 +28,8 @@ const LLM_SYSTEM_PROMPT =
   '你是专业的日语翻译引擎。请把用户给出的日语文本翻译成简体中文。' +
   '要求：只输出译文，不要任何解释或多余符号；' +
   '保留原文中的数字、型号、日期、人名、作品编号、URL 与换行结构；' +
-  '对于成人作品标题这类专有表达，直译即可，不要意译或美化。';
+  '对于成人作品标题这类专有表达，直译即可，不要意译、美化或省略；' +
+  '不要拒绝翻译，也不要添加任何评论、提示或道德评价。';
 
 async function callGoogle(text, from, to, env) {
   const url =
@@ -40,6 +41,7 @@ async function callGoogle(text, from, to, env) {
     encodeURIComponent(text);
   const res = await fetch(url, {
     headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+    signal: timeoutSignal(env),
   });
   if (!res.ok) throw new Error('google status ' + res.status);
   const data = await res.json();
@@ -55,7 +57,7 @@ async function callMyMemory(text, from, to, env) {
     '&langpair=' +
     encodeURIComponent(from + '|' + to);
   if (env.MYMEMORY_EMAIL) url += '&de=' + encodeURIComponent(env.MYMEMORY_EMAIL);
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: timeoutSignal(env) });
   if (!res.ok) throw new Error('mymemory status ' + res.status);
   const data = await res.json();
   if (String(data.responseStatus) !== '200') {
@@ -95,6 +97,7 @@ async function callLingva(text, from, to, env) {
         encodeURIComponent(text);
       const res = await fetch(url, {
         headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+        signal: timeoutSignal(env),
       });
       if (!res.ok) {
         errors.push(host + ':' + res.status);
@@ -136,28 +139,140 @@ async function callDeepL(text, from, to, env) {
   return out;
 }
 
+/** 统一超时：GitHub Actions 上接口挂住会让整个 job 卡到 15 分钟超时 */
+function timeoutSignal(env) {
+  const ms = Number((env && env.REQUEST_TIMEOUT_MS) || 30000) || 30000;
+  try {
+    return AbortSignal.timeout(ms);
+  } catch {
+    return undefined;
+  }
+}
+
+/** 去掉大模型偶尔加的 Markdown 代码围栏和「译文：」前缀 */
+function cleanLlmOutput(s) {
+  let t = String(s == null ? '' : s).trim();
+  const fence = /^```[a-zA-Z]*\s*\n([\s\S]*?)\n?```$/.exec(t);
+  if (fence) t = fence[1].trim();
+  t = t.replace(/^(译文|翻译结果|翻译|Translation)\s*[:：]\s*/i, '');
+  return t.trim();
+}
+
+/**
+ * 模型候选列表：主模型失败就自动尝试后备名。
+ * 智谱等平台的免费模型名会随版本变动（glm-4-flash / glm-4-flash-250414），
+ * 写死一个名字很容易在某个早晨突然全部报「模型不存在」。
+ */
+function llmModelCandidates(env) {
+  const base = String((env && env.LLM_BASE_URL) || '').toLowerCase();
+  const primary =
+    (env && env.LLM_MODEL) || (base.includes('bigmodel') ? 'glm-4-flash' : 'deepseek-chat');
+  const extra = String((env && env.LLM_FALLBACK_MODELS) || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (extra.length === 0 && base.includes('bigmodel')) {
+    extra.push('glm-4-flash-250414', 'glm-4-flashx');
+  }
+  const list = [primary];
+  for (const m of extra) if (m && !list.includes(m)) list.push(m);
+  return list;
+}
+
+// 大模型单点重试次数（首试 + 4 次退避重试），主要应对智谱免费版的 RPM 限流。
+const LLM_MAX_ATTEMPTS = 5;
+const llmSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function callLLM(text, from, to, env) {
   if (!env.LLM_API_KEY || !env.LLM_BASE_URL) throw new Error('llm config missing');
-  const res = await fetch(env.LLM_BASE_URL.replace(/\/+$/, '') + '/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: 'Bearer ' + env.LLM_API_KEY,
-    },
-    body: JSON.stringify({
-      model: env.LLM_MODEL || 'deepseek-chat',
-      temperature: 0.2,
-      messages: [
-        { role: 'system', content: LLM_SYSTEM_PROMPT },
-        { role: 'user', content: text },
-      ],
-    }),
-  });
-  if (!res.ok) throw new Error('llm status ' + res.status);
-  const data = await res.json();
-  const out = (data?.choices?.[0]?.message?.content || '').trim();
-  if (!out) throw new Error('llm empty result');
-  return out;
+  const endpoint = env.LLM_BASE_URL.replace(/\/+$/, '') + '/chat/completions';
+  const signal = timeoutSignal(env);
+  const errors = [];
+
+  for (const model of llmModelCandidates(env)) {
+    let lastErr = '';
+    for (let attempt = 0; attempt < LLM_MAX_ATTEMPTS; attempt++) {
+      let res;
+      try {
+        res = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer ' + env.LLM_API_KEY,
+          },
+          body: JSON.stringify({
+            model,
+            temperature: 0.2,
+            messages: [
+              { role: 'system', content: LLM_SYSTEM_PROMPT },
+              { role: 'user', content: text },
+            ],
+          }),
+          signal,
+        });
+      } catch (err) {
+        // 网络抖动：退避后重试
+        lastErr = model + ' 网络异常: ' + err.message;
+        if (attempt < LLM_MAX_ATTEMPTS - 1) {
+          await llmSleep(800 * Math.pow(2, attempt) + Math.random() * 400);
+          continue;
+        }
+        errors.push(lastErr);
+        break;
+      }
+
+      if (res.ok) {
+        let data;
+        try {
+          data = await res.json();
+        } catch (err) {
+          lastErr = model + ': 返回非 JSON';
+          if (attempt < LLM_MAX_ATTEMPTS - 1) {
+            await llmSleep(800 * Math.pow(2, attempt) + Math.random() * 400);
+            continue;
+          }
+          errors.push(lastErr);
+          break;
+        }
+        const out = cleanLlmOutput(data?.choices?.[0]?.message?.content);
+        if (!out) {
+          lastErr = model + ': 空结果';
+          if (attempt < LLM_MAX_ATTEMPTS - 1) {
+            await llmSleep(800 * Math.pow(2, attempt) + Math.random() * 400);
+            continue;
+          }
+          errors.push(lastErr);
+          break;
+        }
+        return out;
+      }
+
+      // 非 2xx：读错误详情
+      const status = res.status;
+      let detail = '';
+      try {
+        detail = (await res.text()).slice(0, 200);
+      } catch {
+        /* 读不到正文就算了 */
+      }
+      // 429 限流 / 5xx 服务端错误：可重试
+      if (status === 429 || status >= 500) {
+        lastErr = model + ': HTTP ' + status + ' ' + detail;
+        if (attempt < LLM_MAX_ATTEMPTS - 1) {
+          // 指数退避 + 抖动，最长约 8s，给服务端喘息时间
+          await llmSleep(1000 * Math.pow(2, attempt) + Math.random() * 500);
+          continue;
+        }
+        errors.push(lastErr);
+        break;
+      }
+      // 401/403/404/400 等不可重试错误：直接换下一个模型候选
+      errors.push(model + ': HTTP ' + status + ' ' + detail);
+      break;
+    }
+  }
+
+  throw new Error('llm failed [' + errors.join(' | ') + ']');
 }
 
 const ENGINES = {
@@ -171,12 +286,87 @@ const ENGINES = {
 /** 默认降级顺序：免 Key 的免费引擎在前，配了 Key 的高质量引擎在后 */
 const DEFAULT_ORDER = ['google', 'lingva', 'mymemory', 'llm', 'deepl'];
 
+// 免费引擎单次请求能承受的字符上限（MyMemory 有 QUERY LENGTH LIMIT，
+// Google 网页翻译走 GET、URL 也不能太长）。超长文本必须切段后再翻。
+// 可通过环境变量 SEGMENT_LIMIT 覆盖。
+
+/**
+ * 把长文本切成若干小段，尽量在自然断句处断开，保留换行结构。
+ * 切分优先级：换行 → 句号 → 逗号/顿号 → 硬切。
+ */
+function splitSegments(text, limit) {
+  const lim = limit > 0 ? limit : 450;
+  if (!text) return [];
+  if (text.length <= lim) return [text];
+
+  const out = [];
+  const push = (s) => {
+    if (s) out.push(s);
+  };
+  // 注意：buf 必须跨行累积，否则每行都会单独成段，短行多的文本会炸出成百上千次请求
+  let buf = '';
+
+  for (let line of text.split('\n')) {
+    // 先把过长的行按标点切成不超过 lim 的小块
+    const chunks = [];
+    while (line.length > lim) {
+      let cut = -1;
+      // 优先在句末标点后断开
+      for (const mark of ['。', '！', '？']) {
+        const idx = line.lastIndexOf(mark, lim - 1);
+        if (idx >= lim * 0.4) {
+          cut = idx;
+          break;
+        }
+      }
+      // 其次在句中停顿处断开
+      if (cut < 0) {
+        for (const mark of ['、', '，', ' ']) {
+          const idx = line.lastIndexOf(mark, lim - 1);
+          if (idx >= lim * 0.5) {
+            cut = idx;
+            break;
+          }
+        }
+      }
+      // 没有标点就硬切，注意保证长度不超过 lim
+      if (cut < 0) cut = lim - 1;
+      chunks.push(line.slice(0, cut + 1));
+      line = line.slice(cut + 1);
+    }
+    if (line) chunks.push(line);
+
+    // 再把小块尽量合并成接近 lim 的段，减少请求次数
+    for (const chunk of chunks) {
+      if (!buf) {
+        buf = chunk;
+      } else if (buf.length + chunk.length <= lim) {
+        buf += chunk; // 行内切开的块之间不留缝隙，保证拼接后与原文一致
+      } else {
+        push(buf);
+        buf = chunk;
+      }
+    }
+  }
+  push(buf);
+
+  return out;
+}
+
 /**
  * 生成翻译函数：按 order 顺序尝试各引擎，任一成功即返回。
+ * 长文本会自动切段逐段翻译再拼接，避免超出免费引擎的长度限制。
  * @param {string[]} order 例如 ['google','mymemory','llm','deepl']
  */
 function makeTranslator(order, env) {
-  return async function translate(text, from, to) {
+  // 配了大模型就放宽分段：LLM 一次能吃下几千字，段数越少越快、语义也越连贯。
+  // 免费引擎（MyMemory / Google 网页版）必须小段，否则被长度限制直接拒绝。
+  const hasLLM = !!(env && env.LLM_API_KEY && env.LLM_BASE_URL);
+  const defaultLimit = hasLLM ? 3000 : 450;
+  const limit = Number((env && env.SEGMENT_LIMIT) || defaultLimit) || defaultLimit;
+  const segConcurrency = Number((env && env.SEGMENT_CONCURRENCY) || 3) || 3;
+
+  async function translateOne(text, from, to) {
     const errors = [];
     for (const name of order) {
       const fn = ENGINES[name];
@@ -190,6 +380,37 @@ function makeTranslator(order, env) {
       }
     }
     throw new Error('all engines failed [' + errors.join(' | ') + ']');
+  }
+
+  return async function translate(text, from, to) {
+    if (!text || !text.trim()) return text;
+    const segments = splitSegments(text, limit);
+    if (segments.length <= 1) return await translateOne(text, from, to);
+
+    // 分段并发翻译（限制并发数，避免把免费接口打爆）。
+    // 用下标写回保证拼接顺序与原文一致；某段失败就留原文，绝不丢内容。
+    const results = new Array(segments.length);
+    let cursor = 0;
+    let okCount = 0;
+    let lastErr = null;
+    const poolSize = Math.max(1, Math.min(segConcurrency, segments.length));
+
+    const workers = Array.from({ length: poolSize }, async () => {
+      while (cursor < segments.length) {
+        const i = cursor++;
+        try {
+          results[i] = await translateOne(segments[i], from, to);
+          okCount++;
+        } catch (err) {
+          lastErr = err;
+          results[i] = segments[i];
+        }
+      }
+    });
+    await Promise.all(workers);
+
+    if (okCount === 0 && lastErr) throw lastErr;
+    return results.join('');
   };
 }
 
@@ -208,11 +429,21 @@ const DEFAULTS = {
   translateContent: false,
   keepOriginal: true, // 在 description 里追加【原文】，方便回看与搜索
   onlyJapanese: true, // 只翻含日文字符的文本，跳过数字/英文/链接
-  maxCharsPerField: 300, // 超长截断，控制免费额度消耗
+  maxCharsPerField: 300, // 标题/分类等纯文本字段的超长截断
+  maxCharsPerHtmlUnit: 1500, // 正文 HTML 里单个文本节点的上限（超出则截断）
   maxItems: 40,
   concurrency: 3,
   translationTtl: 60 * 60 * 24 * 30, // 单条译文缓存 30 天
 };
+
+// 这些字段的内容通常是 HTML，翻译时必须保留标签（图片、链接、排版），
+// 只能替换文本节点，不能像标题那样整段剥掉标签。
+const HTML_FIELDS = new Set([
+  'description',
+  'summary',
+  'content:encoded',
+  'content',
+]);
 
 // 含假名/汉字即视为需要翻译
 const JA_RE =
@@ -244,6 +475,106 @@ function escapeXml(s) {
 
 function cdataSafe(s) {
   return String(s).replace(/\]\]>/g, ']]]]><![CDATA[>');
+}
+
+/* --------------------------- HTML 安全翻译 --------------------------- */
+
+/** 取出字段内容的原始 HTML：CDATA 原样取，否则先做 XML 实体解码 */
+function unwrapInner(inner) {
+  const cdata = /^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/.exec(inner);
+  if (cdata) return { html: cdata[1], isCdata: true };
+  return { html: decodeEntities(inner), isCdata: false };
+}
+
+/** 把 HTML 放回字段：CDATA 原样放，否则重新转义成 XML 文本 */
+function wrapInner(html, isCdata) {
+  return isCdata ? '<![CDATA[' + cdataSafe(html) + ']]>' : escapeXml(html);
+}
+
+/** 在 HTML 文本节点里转义，避免译文意外产生标签 */
+function escapeHtmlText(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * 把 HTML 切成「标签」与「文本」交替的节点序列。
+ * <script>/<style> 里的内容标记 skip=true，不参与翻译。
+ */
+function tokenizeHtml(html) {
+  const nodes = [];
+  const re = /<[^>]*>/g;
+  let last = 0;
+  let inSkip = false;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    if (m.index > last) {
+      nodes.push({ tag: false, v: html.slice(last, m.index), skip: inSkip });
+    }
+    const tagText = m[0];
+    nodes.push({ tag: true, v: tagText, skip: inSkip });
+    const nameMatch = /^<\/?\s*([a-zA-Z0-9:-]+)/.exec(tagText);
+    const name = nameMatch ? nameMatch[1].toLowerCase() : '';
+    const closing = /^<\s*\//.test(tagText);
+    if (name === 'script' || name === 'style') inSkip = !closing;
+    last = m.index + tagText.length;
+  }
+  if (last < html.length) nodes.push({ tag: false, v: html.slice(last), skip: inSkip });
+  return nodes;
+}
+
+/**
+ * 抽取单个文本节点的可翻译内容。
+ * 返回 null 表示跳过；否则返回 { lead, trail, key }，
+ * lead/trail 是原文前后的空白，替换时原样保留。
+ */
+function htmlUnitText(raw, cfg) {
+  const lead = /^\s*/.exec(raw)[0];
+  const trail = /\s*$/.exec(raw)[0];
+  const core = raw.slice(lead.length, raw.length - trail.length);
+  if (!core) return null;
+  let key = decodeEntities(core).replace(/\s+/g, ' ').trim();
+  if (!key) return null;
+  const cap = Number(cfg.maxCharsPerHtmlUnit) > 0 ? Number(cfg.maxCharsPerHtmlUnit) : 1500;
+  if (key.length > cap) key = key.slice(0, cap);
+  return { lead, trail, key };
+}
+
+/** 收集一个 HTML 字段里所有待翻译文本（去重由调用方的 Set 保证） */
+function collectHtmlTexts(inner, cfg, out) {
+  const { html } = unwrapInner(inner);
+  for (const node of tokenizeHtml(html)) {
+    if (node.tag || node.skip) continue;
+    const unit = htmlUnitText(node.v, cfg);
+    if (!unit) continue;
+    if (cfg.onlyJapanese && !JA_RE.test(unit.key)) continue;
+    out.add(unit.key);
+  }
+}
+
+/**
+ * 用译文替换 HTML 字段里的文本节点，标签原样保留。
+ * 没有任何一处被替换时返回 null（调用方据此保持原文不动）。
+ */
+function applyHtmlTranslation(inner, map, cfg) {
+  const { html, isCdata } = unwrapInner(inner);
+  const nodes = tokenizeHtml(html);
+  let changed = false;
+  for (const node of nodes) {
+    if (node.tag || node.skip) continue;
+    const unit = htmlUnitText(node.v, cfg);
+    if (!unit) continue;
+    const translated = map.get(unit.key);
+    if (!translated) continue;
+    // CDATA 里是原始 HTML，需要自己转义；非 CDATA 时 wrapInner 会统一 escapeXml，
+    // 此处再转义一次就会变成 &amp;amp; 双重转义。
+    node.v = unit.lead + (isCdata ? escapeHtmlText(translated) : translated) + unit.trail;
+    changed = true;
+  }
+  if (!changed) return null;
+  return wrapInner(
+    nodes.map((n) => n.v).join(''),
+    isCdata
+  );
 }
 
 /** 同步哈希，用作缓存键（Worker 与 Node 都可用） */
@@ -283,6 +614,29 @@ function tagRegex(tag) {
   return new RegExp('<' + tag + '(\\s[^>]*)?>([\\s\\S]*?)<\\/' + tag + '>', 'gi');
 }
 
+/**
+ * 生成 String.replace 的回调：HTML 字段走标签保留路径，其余字段整段替换。
+ * 抽出来是为了让「文档头部」和「item 区块」两条替换路径行为完全一致。
+ */
+function replaceTagCallback(tag, map, cfg) {
+  const isHtml = HTML_FIELDS.has(String(tag).toLowerCase());
+  return (m, attrs, inner) => {
+    if (isHtml) {
+      const body = applyHtmlTranslation(inner, map, cfg);
+      if (body === null) return m;
+      return '<' + tag + (attrs || '') + '>' + body + '</' + tag + '>';
+    }
+    const text = normalizeTagContent(inner, cfg);
+    const translated = text ? map.get(text) : null;
+    if (!translated) return m;
+    const isCdata = /^\s*<!\[CDATA\[/.test(inner);
+    const body = isCdata
+      ? '<![CDATA[' + cdataSafe(translated) + ']]>'
+      : escapeXml(translated);
+    return '<' + tag + (attrs || '') + '>' + body + '</' + tag + '>';
+  };
+}
+
 /** 扫描整份文档，收集所有需要翻译的文本（去重） */
 function collectTexts(xml, cfg) {
   const found = new Set();
@@ -290,6 +644,10 @@ function collectTexts(xml, cfg) {
     const re = tagRegex(tag);
     let m;
     while ((m = re.exec(xml)) !== null) {
+      if (HTML_FIELDS.has(tag.toLowerCase())) {
+        collectHtmlTexts(m[2], cfg, found);
+        continue;
+      }
       const text = normalizeTagContent(m[2], cfg);
       if (!text) continue;
       if (cfg.onlyJapanese && !JA_RE.test(text)) continue;
@@ -356,16 +714,7 @@ function applyToBlock(block, map, cfg) {
 
   let out = block;
   for (const tag of targetTags(cfg)) {
-    out = out.replace(tagRegex(tag), (m, attrs, inner) => {
-      const text = normalizeTagContent(inner, cfg);
-      const translated = text ? map.get(text) : null;
-      if (!translated) return m;
-      const isCdata = /^\s*<!\[CDATA\[/.test(inner);
-      const body = isCdata
-        ? '<![CDATA[' + cdataSafe(translated) + ']]>'
-        : escapeXml(translated);
-      return '<' + tag + (attrs || '') + '>' + body + '</' + tag + '>';
-    });
+    out = out.replace(tagRegex(tag), replaceTagCallback(tag, map, cfg));
   }
 
   if (cfg.keepOriginal && originalTitle) {
@@ -376,6 +725,14 @@ function applyToBlock(block, map, cfg) {
     out = out.replace(
       /<(description|summary)(\s[^>]*)?>([\s\S]*?)<\/\1>/i,
       (m, tag, attrs, inner) => {
+        const unwrapped = unwrapInner(inner);
+        // 字段内容是 HTML 时，追加一个 <br> 原文行，不能把标签结构破坏掉
+        if (/<[a-zA-Z!/]/.test(unwrapped.html)) {
+          const merged = unwrapped.html + '<br>\n' + escapeHtmlText(marker);
+          return (
+            '<' + tag + (attrs || '') + '>' + wrapInner(merged, unwrapped.isCdata) + '</' + tag + '>'
+          );
+        }
         const isCdata = /^\s*<!\[CDATA\[/.test(inner);
         const text = normalizeTagContent(inner, cfg) || '';
         const merged = text ? text + '\n' + marker : marker;
@@ -422,16 +779,7 @@ async function translateFeedXml(xml, ctx) {
   // 4) 重建文档
   let newHead = head;
   for (const tag of targetTags(cfg)) {
-    newHead = newHead.replace(tagRegex(tag), (mm, attrs, inner) => {
-      const text = normalizeTagContent(inner, cfg);
-      const translated = text ? map.get(text) : null;
-      if (!translated) return mm;
-      const isCdata = /^\s*<!\[CDATA\[/.test(inner);
-      const body = isCdata
-        ? '<![CDATA[' + cdataSafe(translated) + ']]>'
-        : escapeXml(translated);
-      return '<' + tag + (attrs || '') + '>' + body + '</' + tag + '>';
-    });
+    newHead = newHead.replace(tagRegex(tag), replaceTagCallback(tag, map, cfg));
   }
 
   const newBlocks = blocks.map((b) => applyToBlock(b.text, map, cfg));
@@ -467,15 +815,23 @@ const config = {
   keepOriginal: bool(env.KEEP_ORIGINAL, DEFAULTS.keepOriginal),
   onlyJapanese: DEFAULTS.onlyJapanese,
   maxCharsPerField: Number(env.MAX_CHARS || DEFAULTS.maxCharsPerField),
+  maxCharsPerHtmlUnit: Number(env.MAX_CHARS_PER_HTML_UNIT || DEFAULTS.maxCharsPerHtmlUnit),
   maxItems: Number(env.MAX_ITEMS || DEFAULTS.maxItems),
   concurrency: Number(env.CONCURRENCY || DEFAULTS.concurrency),
   translationTtl: Number(env.TRANSLATION_TTL_DAYS || 30) * 86400,
 };
 
-const translators = (env.TRANSLATORS || DEFAULT_ORDER.join(','))
+// 配了大模型就让它打头阵：译文风格统一、长句更通顺；免费引擎自动退居后备。
+// 想强制指定顺序可设 TRANSLATORS，例如 TRANSLATORS=llm,google,mymemory
+const hasLLM = !!(env.LLM_API_KEY && env.LLM_BASE_URL);
+const llmFirstOrder = ['llm', ...DEFAULT_ORDER.filter((x) => x !== 'llm')];
+const translators = (env.TRANSLATORS || (hasLLM ? llmFirstOrder : DEFAULT_ORDER).join(','))
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
+
+// 大模型并发能力远强于免费接口，默认开高一点（智谱限 30 并发，留足余量）
+if (!env.CONCURRENCY && hasLLM) config.concurrency = 8;
 
 /* ------------------------------ feeds.txt ------------------------------ */
 
@@ -758,6 +1114,17 @@ async function main() {
 
   await mkdir(DOCS, { recursive: true });
   console.log(`[start] ${feeds.length} 个源 | 引擎顺序：${translators.join(' → ')}`);
+  console.log(
+    `[start] 翻译范围：标题=${config.translateTitle} 分类=${config.translateCategories} ` +
+      `摘要=${config.translateDescription} 正文=${config.translateContent} | 并发 ${config.concurrency}`
+  );
+  if (hasLLM) {
+    console.log(
+      `[start] 大模型：${env.LLM_BASE_URL} · 模型候选 ${llmModelCandidates(env).join(' / ')}`
+    );
+  } else {
+    console.log('[start] 未配置大模型，全部走免费引擎（可在仓库 Variables 里配 LLM_* 提升质量）');
+  }
   if (FORCE) console.log('[start] FORCE 模式：忽略已有译文缓存');
 
   for (let i = 0; i < feeds.length; i++) {
